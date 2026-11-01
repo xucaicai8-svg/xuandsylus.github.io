@@ -1,0 +1,1480 @@
+document.addEventListener('DOMContentLoaded', async () => {
+    // ── 低端设备自动降级：检测低内存/老安卓/低核心数，关闭全站毛玻璃与重型动画，缓解持续卡顿 ──
+    // backdrop-filter 在低端 WebView 上是持续的合成层开销（全站约 70 处），是"聊天/桌面/启动都卡"的头号渲染源。
+    try {
+        const nav = navigator;
+        const ua = nav.userAgent || '';
+        const m = ua.match(/Android\s+(\d+(?:\.\d+)?)/);
+        const androidVer = m ? parseFloat(m[1]) : 0;
+        const mem = (nav.deviceMemory || 0) * 1024 * 1024 * 1024;   // 字节；Chrome/Chromium 提供
+        const cores = nav.hardwareConcurrency || 0;
+        // 部分 WebView 不暴露 deviceMemory/hardwareConcurrency（读到 0）：
+        // 无法证明是高配机时按低配处理，直接关闭全站毛玻璃，避免"测不到就全开"导致中端机依然卡顿
+        const noStats = (mem <= 0 || cores <= 0);
+        const isLite = noStats || (
+            (mem > 0 && mem <= 6 * 1024 * 1024 * 1024) ||          // ≤6GB 内存（覆盖主流中端机）
+            (cores > 0 && cores <= 6) ||                            // ≤6 核
+            (androidVer >= 5 && androidVer < 11)                    // 老/中端安卓(5-10)
+        );
+        if (isLite) {
+            document.documentElement.setAttribute('data-lite', '1');
+            const st = document.createElement('style');
+            st.id = 'lite-degrade-style';
+            st.textContent = [
+                'html[data-lite] *,html[data-lite] *::before,html[data-lite] *::after{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;}',
+                'html[data-lite] .star,html[data-lite] .wp,html[data-lite] .meteor,html[data-lite] .sparkle{display:none!important;}',
+                'html[data-lite] .dt-polaroid-card{transition:none!important;}',
+                'html[data-lite] .message-input,html[data-lite] textarea{transition:none!important;}',
+                'html[data-lite] .input-area-wrapper{transition:background-color .1s ease!important;}',
+                'html[data-lite] .dt-app-grid,html[data-lite] .app-grid{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;background:rgba(255,255,255,.6)!important;}',
+                'html[data-lite] .dt-heartbeat .hb-run{animation:none!important;stroke-dashoffset:0!important;}',
+                'html[data-lite] .dt-avatar,html[data-lite] .dt-name,html[data-lite] .dt-sig{transition:none!important;}'
+            ].join('\n');
+            document.head.appendChild(st);
+        }
+    } catch (e) {
+        // 降级失败不影响启动
+    }
+
+    const loaderBar = document.getElementById('loader-tech-bar');
+    const welcomeSubtitle = document.querySelector('.welcome-subtitle-scramble');
+    const welcomeScreen = document.getElementById('welcome-animation');
+    const disclaimerModal = document.getElementById('disclaimer-modal');
+    const acceptDisclaimerBtn = document.getElementById('accept-disclaimer');
+
+    const updateLoader = (text, width) => {
+        // 标题在 loadData 完成前也固定为品牌名，避免开屏一直显示静态占位文案
+        (function () { const t = document.getElementById('welcome-title-glitch'); if (t) t.textContent = '传讯'; })();
+        if (welcomeSubtitle) welcomeSubtitle.textContent = text;
+        if (loaderBar) loaderBar.style.width = width;
+    };
+
+    const hideWelcomeScreen = () => {
+        if (!welcomeScreen) return;
+        welcomeScreen.classList.add('hidden');
+        setTimeout(() => {
+            welcomeScreen.style.display = 'none';
+        }, 800);
+    };
+
+    const safeAwait = async (promise, fallback = null) => {
+        try {
+            return await promise;
+        } catch (error) {
+            console.error('操作失败:', error);
+            return fallback;
+        }
+    };
+
+    try {
+        try { setupEventListeners?.(); } catch(e) { console.error('setupEventListeners:', e); }
+
+        if (typeof localforage === 'undefined') {
+            console.warn('LocalForage 未加载，将使用 localStorage 降级方案');
+        }
+
+        try {
+            const emergencyBackupRaw = localStorage.getItem('BACKUP_V1_critical');
+            if (emergencyBackupRaw) {
+                const emergencyBackup = JSON.parse(emergencyBackupRaw);
+                if (emergencyBackup && Array.isArray(emergencyBackup.messages) && emergencyBackup.messages.length > 0) {
+                    console.warn('[boot] 检测到紧急备份，可用于异常恢复');
+                }
+            }
+        } catch (e) {
+            console.warn('[boot] 紧急备份检查失败:', e);
+        }
+
+        updateLoader('正在建立安全连接...', '10%');
+        await safeAwait(initializeSession());
+
+        updateLoader('正在读取记忆存档...', '40%');
+        await safeAwait(loadData());
+
+        updateLoader('正在渲染我们的世界...', '70%');
+        
+        await Promise.allSettled([
+            safeAwait(initializeRandomUI?.()),
+            safeAwait(initMusicPlayer?.())
+        ]);
+
+        setInterval(checkStatusChange, 60000);
+        // 情侣空间动态周期检测：让梦角发动态/点赞/评论按时触发，并推送系统通知
+        setInterval(function () {
+            try { if (typeof checkMomentsStatus === 'function') checkMomentsStatus(); } catch (e) {}
+        }, 60000);
+
+        updateLoader('连接成功，欢迎回来。', '100%');
+
+        // ===== 启动进入顺序：使用前声明 → 欢迎动画 → 桌面 → 免责/引导/公告 =====
+        const signed = localStorage.getItem('splashPledgeSigned_v3') === 'true';
+        const tourSeen = await safeAwait(localforage?.getItem(APP_PREFIX + 'tour_seen'), localStorage.getItem('tourSeenDone') === '1');
+
+        function showWelcome() {
+            if (!welcomeScreen) return;
+            welcomeScreen.classList.remove('hidden');
+            welcomeScreen.style.display = 'flex';
+        }
+        // 播放欢迎动画：重新跑一遍开场动画，停留片刻淡出后再执行 next
+        function playWelcomeAndGive(next) {
+            showWelcome();
+            try { if (typeof initializeRandomUI === 'function') { initializeRandomUI(); } } catch (e) {}
+            setTimeout(function () {
+                hideWelcomeScreen();
+                setTimeout(next, 850);
+            }, 3000);
+        }
+        function enterDisclaimer() {
+            showModal(disclaimerModal);
+            if (acceptDisclaimerBtn && !acceptDisclaimerBtn._bound) {
+                acceptDisclaimerBtn._bound = true;
+                acceptDisclaimerBtn.addEventListener('click', function () {
+                    hideModal(disclaimerModal);
+                    localforage?.setItem(APP_PREFIX + 'tour_seen', true).catch(function () {});
+                    startTour?.();
+                }, { once: true });
+            }
+        }
+        function revealDesktopAndProceed() {
+            document.body.classList.add('dt-view');
+            try { if (window.DesktopTopbar && typeof window.DesktopTopbar.showDesktop === 'function') window.DesktopTopbar.showDesktop(); } catch (e) {}
+            // 未完成引导 → 免责声明 → 新手指引（结束后由 endTour 弹今日公告）
+            if (!tourSeen) {
+                enterDisclaimer();
+            } else {
+                // 已完成引导 → 直接弹今日公告
+                setTimeout(function () {
+                    try { if (typeof window.tryShowDailyGreeting === 'function') window.tryShowDailyGreeting(); } catch (e) {}
+                }, 600);
+            }
+            window.__bootGateDone = true;
+        }
+
+        if (!signed) {
+            // 首次进入：先显示使用前声明，欢迎动画临时隐藏，声明结束后再播
+            if (welcomeScreen) { welcomeScreen.classList.add('hidden'); welcomeScreen.style.display = 'none'; }
+            window.__onSplashDone = function () {
+                delete window.__onSplashDone;
+                playWelcomeAndGive(function () { revealDesktopAndProceed(); });
+            };
+        } else {
+            // 再次进入：直接播放欢迎动画
+            playWelcomeAndGive(function () { revealDesktopAndProceed(); });
+        }
+
+        // 自动检查更新（启动后延迟执行，避免影响启动性能）
+        setTimeout(function () {
+            if (typeof autoCheckUpdate === 'function') autoCheckUpdate();
+        }, 5000);
+
+        // 启动前台服务保活（更新通知昵称）
+        setTimeout(function () {
+            if (typeof ForegroundBridge !== 'undefined') {
+                ForegroundBridge.start();
+                // 首次启动自动检查电池优化豁免（仅提示一次）
+                try {
+                    if (!localStorage.getItem('batteryOptChecked')) {
+                        ForegroundBridge.isBatteryOptimized(function(ignored) {
+                            if (!ignored) {
+                                ForegroundBridge.requestBatteryOptimization();
+                            }
+                            localStorage.setItem('batteryOptChecked', '1');
+                        });
+                    }
+                } catch(e) {}
+                // Android 12+：精确闹钟(SCHEDULE_EXACT_ALARM)默认不授予，未授权时后台定时唤醒
+                // 会退化为非精确、Doze 下推送延迟/不稳定。启动时检查一次并引导授权（仅提示一次）。
+                try {
+                    if (!localStorage.getItem('exactAlarmGuided')) {
+                        ForegroundBridge.requestExactAlarm(function (r) {
+                            if (r && r.needAction) {
+                                try {
+                                    if (typeof showNotification === 'function') {
+                                        showNotification('为准时后台提醒，请允许"闹钟和提醒"权限', 'info', 3000);
+                                    }
+                                } catch (e3) {}
+                            }
+                            localStorage.setItem('exactAlarmGuided', '1');
+                        });
+                    }
+                } catch (e3) {}
+                // 首次启动：国产厂商(小米/华为/OPPO/vivo/魅族)系统级保活白名单引导，仅一次；
+                // 非原生或非国产自动跳过。引导用户把 App 加入"自启动/后台/省电"白名单，
+                // 显著提升真实设备上被厂商省电策略杀掉前的存活率。
+                try {
+                    if (!localStorage.getItem('batterySaverGuided')) {
+                        ForegroundBridge.getManufacturer(function (brand) {
+                            var domestic = brand === 'xiaomi' || brand === 'huawei'
+                                || brand === 'oppo' || brand === 'vivo' || brand === 'meizu';
+                            if (domestic) {
+                                try {
+                                    if (typeof showNotification === 'function') {
+                                        showNotification('为后台不漏消息，请允许本应用自启动/后台运行', 'info', 3000);
+                                    }
+                                } catch (e3) {}
+                                ForegroundBridge.openBatterySaverGuide();
+                            }
+                            localStorage.setItem('batterySaverGuided', '1');
+                        });
+                    }
+                } catch (e2) {}
+            }
+        }, 1000);
+
+        // ── 后台消息通知 ───────────────────────────────────────────────
+        // 不再预定原生"虚拟"通知：后台由前台服务 + WakeLock 保活 WebView 持续运行，
+        // JS 定时器到点照常发出真实消息，每条真实消息经 _sendPartnerNotification 各自弹真实通知。
+        // 保留兼容用的取消桥（无副作用），便于旧设置里已保存的预定被清理。
+        function nativeMsgAlarmSupport() {
+            try {
+                return !!(window.Capacitor && window.Capacitor.Plugins
+                    && window.Capacitor.Plugins.NotificationPlugin
+                    && typeof window.Capacitor.Plugins.NotificationPlugin.scheduleMessage === 'function');
+            } catch (e) { return false; }
+        }
+        window._cancelNativeMessageAlarm = function () {
+            if (!nativeMsgAlarmSupport()) return;
+            try {
+                window.Capacitor.Plugins.NotificationPlugin.cancelScheduledMessage({}).catch(function () {});
+            } catch (e) {}
+        };
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                try {
+                    if (typeof saveTimeout !== 'undefined') clearTimeout(saveTimeout);
+                } catch (e) {}
+                try { if (typeof _flushCriticalBackup === 'function') _flushCriticalBackup(); else _backupCriticalData(); } catch (e) { console.warn('[visibilitychange] 紧急备份失败:', e); }
+                // 进入后台时重新拉起前台服务/定时唤醒，确保长时间后台保活
+                try {
+                    if (typeof ForegroundBridge !== 'undefined' && ForegroundBridge.isSupported()) {
+                        ForegroundBridge.start();
+                    }
+                } catch (e) { console.warn('[visibilitychange] 重新拉起保活失败:', e); }
+                try {
+                    // saveData(true)：切后台时强制绕过消息落库节流，立即把整份消息（含图片）写进 IndexedDB，
+                    // 避免依赖 3 秒节流导致退出时丢最新消息
+                    const p = saveData(true);
+                    if (p && typeof p.catch === 'function') {
+                        p.catch(e => console.error('[visibilitychange] 保存失败:', e));
+                    }
+                } catch (e) {
+                    console.error('[visibilitychange] 保存失败:', e);
+                }
+            } else if (document.visibilityState === 'visible') {
+                // 回到前台：取消后台消息闹钟，把控制权交还给 WebView 定时器，避免前台重复弹通知
+                _cancelNativeMessageAlarm();
+                // 回到前台时：如果距离上次回复已超过自动发送间隔，立即补发一条消息
+                // 不需要重启定时器，setInterval 在后台也会持续触发（只是可能被节流）
+                try {
+                    if (typeof settings !== 'undefined' && settings.autoSendEnabled && window._lastReplyTs) {
+                        var intervalMs = (settings.autoSendInterval || 5) * 60 * 1000;
+                        var elapsed = Date.now() - window._lastReplyTs;
+                        if (elapsed >= intervalMs && typeof simulateReply === 'function') {
+                            // 清除防抖锁，确保本次能正常触发
+                            window._simulateReplyLockUntil = 0;
+                            simulateReply();
+                        }
+                    }
+                } catch(e) { console.warn('[visibilitychange] 补发消息失败:', e); }
+
+                try {
+                    // 回到前台：先把当前帧渲染出去，避免下面任何恢复/检查阻塞首帧（"回到前台卡顿"来源）
+                    requestAnimationFrame(() => {
+                        try {
+                            // 分片处理备份恢复：备份消息较多时分批 map，避免一次同步展开上万条卡死主线程
+                            const backup = typeof _tryRecoverFromBackup === 'function' ? _tryRecoverFromBackup() : null;
+                            if (backup && Array.isArray(backup.messages) && backup.messages.length > 0 && Array.isArray(messages) && backup.messages.length > messages.length) {
+                                // 备份消息数远大于当前内存时，说明确实丢了不少；否则轻微差异不做全量恢复
+                                if (backup.messages.length - messages.length < 3) {
+                                    // 差异很小，直接放弃恢复，避免把当前页面内容整体替换
+                                } else {
+                                    console.warn('[visibilitychange] 检测到备份消息比当前更多，自动尝试恢复');
+                                    const srcMsgs = backup.messages;
+                                    const target = new Array(srcMsgs.length);
+                                    let idx = 0;
+                                    const CHUNK = 200;
+                                    const step = () => {
+                                        const end = Math.min(idx + CHUNK, srcMsgs.length);
+                                        for (; idx < end; idx++) {
+                                            const m = srcMsgs[idx];
+                                            const ts = new Date(m.timestamp);
+                                            target[idx] = Object.assign({}, m, { timestamp: isNaN(ts.getTime()) ? new Date() : ts });
+                                        }
+                                        if (idx < srcMsgs.length) {
+                                            requestAnimationFrame(step);
+                                        } else {
+                                            messages = target;
+                                            if (backup.settings) Object.assign(settings, backup.settings);
+                                            if (typeof updateUI === 'function') updateUI();
+                                            if (typeof throttledSaveData === 'function') throttledSaveData();
+                                            showNotification('已自动恢复本地临时备份内容', 'warning', 3500);
+                                        }
+                                    };
+                                    requestAnimationFrame(step);
+                                }
+                            }
+                        } catch (restoreErr) {
+                            console.warn('[visibilitychange] 自动恢复失败，保留当前页面内容:', restoreErr);
+                        }
+                        // 回到前台时立即检查信封回信状态（也放入 rAF，避免与上面恢复抢占首帧）
+                        try {
+                            if (typeof checkEnvelopeStatus === 'function') {
+                                checkEnvelopeStatus().catch(function(e) { console.warn('[visibilitychange] 信封检查失败:', e); });
+                            }
+                        } catch(e) { console.warn('[visibilitychange] 信封检查异常:', e); }
+                    });
+                } catch (e) {
+                    console.warn('[visibilitychange] 恢复调度异常:', e);
+                }
+            }
+        });
+
+        window.addEventListener('pagehide', () => {
+            try { if (typeof saveData === 'function') saveData(true).catch(() => {}); } catch (e) {}
+            try { if (typeof _flushCriticalBackup === 'function') _flushCriticalBackup(); else _backupCriticalData(); } catch (e) {}
+        });
+
+        window.addEventListener('beforeunload', () => {
+            try { if (typeof saveData === 'function') saveData(true).catch(() => {}); } catch (e) {}
+            try { if (typeof _flushCriticalBackup === 'function') _flushCriticalBackup(); else _backupCriticalData(); } catch (e) {}
+        });
+
+        setInterval(() => {
+            saveData().catch(e => console.warn('[autoBackup] 定时保存失败:', e));
+        }, 3 * 60 * 1000);
+
+        // 周期性核对信封回信状态：网页保持在前台长时间打开（不切走、不刷新）时，
+        // 之前只有"加载/启动/回到前台"才会核对，若用户开着页面超过回信时长，回信就不会生成。
+        // 这里每 60 秒补一次前台核对，确保 replyTime 到点后回信能在 1 分钟内生成。
+        setInterval(() => {
+            if (typeof checkEnvelopeStatus === 'function') {
+                try {
+                    checkEnvelopeStatus().catch(function(e) { console.warn('[envelope] 周期回信核对失败:', e); });
+                } catch (e) { console.warn('[envelope] 周期回信核对异常:', e); }
+            }
+        }, 60 * 1000);
+
+        (() => {
+            const REMIND_KEY = 'exportReminderLastShown';
+            const last = parseInt(localStorage.getItem(REMIND_KEY) || '0', 10);
+            const daysSince = (Date.now() - last) / (1000 * 60 * 60 * 24);
+            if (daysSince >= 7) {
+                setTimeout(() => {
+                    showNotification('建议定期导出备份，防止数据意外丢失', 'info', 7000);
+                    localStorage.setItem(REMIND_KEY, String(Date.now()));
+                }, 8000);
+            }
+        })();
+
+        setTimeout(async () => {
+            if ('Notification' in window && Notification.permission === 'default') {
+                try {
+                    const permission = await Notification.requestPermission();
+                    if (permission === 'granted') {
+                        showNotification('已开启系统通知，收到消息时会提醒你', 'success', 3000);
+                    }
+                } catch(e) {
+                    console.warn('通知权限请求失败:', e);
+                }
+            }
+        }, 3000);
+
+    } catch (err) {
+        console.error('严重初始化错误:', err);
+        try {
+            const backup = typeof _tryRecoverFromBackup === 'function' ? _tryRecoverFromBackup() : null;
+            if (backup && Array.isArray(backup.messages) && backup.messages.length > 0) {
+                messages = backup.messages.map(m => {
+                    const ts = new Date(m.timestamp);
+                    return { ...m, timestamp: isNaN(ts.getTime()) ? new Date() : ts };
+                });
+                if (backup.settings) Object.assign(settings, backup.settings);
+                if (typeof updateUI === 'function') updateUI();
+                showNotification('初始化异常，已使用本地紧急备份恢复', 'warning', 5000);
+            }
+        } catch (recoverErr) {
+            console.warn('[boot] 初始化失败后的恢复也失败:', recoverErr);
+        }
+        updateLoader('加载遇到问题，已强制进入...', '100%');
+        setTimeout(hideWelcomeScreen, 900);
+    }
+
+    // 贴纸上传事件监听（在 DOMContentLoaded 内确保元素已存在）
+    const stickerInput = document.getElementById('sticker-file-input');
+    if (stickerInput) {
+        stickerInput.addEventListener('change', async (e) => {
+            const files = Array.from(e.target.files);
+            if (!files.length) return;
+
+            const oversized = files.filter(f => f.size > 2 * 1024 * 1024);
+            if (oversized.length > 0) {
+                showNotification(oversized.length + ' 张图片超过 2MB 限制，已跳过', 'warning');
+            }
+
+            const validFiles = files.filter(f => f.size <= 2 * 1024 * 1024);
+            if (!validFiles.length) return;
+
+            showNotification('正在批量处理 ' + validFiles.length + ' 张图片...', 'info');
+
+            let successCount = 0;
+            let failCount = 0;
+            const cloudReady = !!(window.CloudMedia && window.CloudSync && window.CloudSync.isConnected());
+
+            for (const file of validFiles) {
+                try {
+                    const base64 = await optimizeImage(file, 300, 0.8);
+                    let toStore = base64;
+                    if (cloudReady) {
+                        try {
+                            const r = await window.CloudMedia.upload(base64, 'stickers');
+                            toStore = r.url;
+                        } catch (upErr) {
+                            console.warn('[cloud-media] 贴纸上传失败，降级本地', upErr);
+                        }
+                    }
+                    stickerLibrary.push(toStore);
+                    successCount++;
+                } catch (err) {
+                    console.error(err);
+                    failCount++;
+                }
+            }
+
+            throttledSaveData();
+            renderReplyLibrary();
+
+            if (failCount > 0) {
+                showNotification('上传完成：' + successCount + ' 张成功，' + failCount + ' 张失败', 'warning');
+            } else {
+                showNotification('上传成功，共 ' + successCount + ' 张', 'success');
+            }
+
+            e.target.value = '';
+        });
+    }
+
+    const myStickerQuickUpload = document.getElementById('my-sticker-quick-upload');
+    if (myStickerQuickUpload) {
+        myStickerQuickUpload.addEventListener('change', async (e) => {
+            const files = Array.from(e.target.files);
+            if (!files.length) return;
+            const oversized = files.filter(f => f.size > 2 * 1024 * 1024);
+            if (oversized.length > 0) showNotification(oversized.length + ' 张图片超过 2MB，已跳过', 'warning');
+            const validFiles = files.filter(f => f.size <= 2 * 1024 * 1024);
+            if (!validFiles.length) return;
+            showNotification('正在处理 ' + validFiles.length + ' 张...', 'info');
+            let ok = 0, fail = 0;
+            const newStickers = [];
+            const cloudReady = !!(window.CloudMedia && window.CloudSync && window.CloudSync.isConnected());
+            // 与 games.js 的数据结构保持一致：每个表情必须是 {id, src, groupId, addedAt} 的对象，
+            // 不能塞纯字符串——否则渲染时 e.src 取不到 → 破损图；批量管理时没有 id →
+            // 所有破损条目的 data-id 都是 "undefined"，点一个就全选、删除时匹配不到、永远删不掉
+            const base = Date.now();
+            let added = 0;
+            for (const file of validFiles) {
+                try {
+                    const base64 = await optimizeImage(file, 300, 0.8);
+                    let toStore = base64;
+                    if (cloudReady) {
+                        try {
+                            const r = await window.CloudMedia.upload(base64, 'my-stickers');
+                            toStore = r.url;
+                        } catch (upErr) {
+                            console.warn('[cloud-media] 我的贴纸上传失败，降级本地', upErr);
+                        }
+                    }
+                    newStickers.push({
+                        id: 'stk_' + base + '_' + added,
+                        src: toStore,
+                        groupId: window._myStickerActiveGroup || null,
+                        addedAt: base - added,
+                        groupJoinedAt: base - added
+                    });
+                    added++;
+                    ok++;
+                } catch(err) { fail++; }
+            }
+            myStickerLibrary.unshift(...newStickers);
+            throttledSaveData();
+            if (typeof renderComboContent === 'function') renderComboContent('my-sticker');
+            showNotification(fail > 0 ? `上传完成：${ok} 成功 ${fail} 失败` : `✓ 已添加 ${ok} 张到我的表情库`, fail > 0 ? 'warning' : 'success');
+            e.target.value = '';
+        });
+    }
+});
+// 启动时检查闪退未结束的陪伴会话（独立于 load 事件，确保一定执行）
+(function() {
+    function _cdRecLog(msg, data) {
+        try {
+            const logs = JSON.parse(localStorage.getItem('_cdRecLogs') || '[]');
+            logs.push({ t: new Date().toLocaleTimeString(), msg: msg, data: data === undefined ? '' : JSON.stringify(data) });
+            if (logs.length > 50) logs.splice(0, logs.length - 50);
+            localStorage.setItem('_cdRecLogs', JSON.stringify(logs));
+        } catch (e) {}
+        try { console.log('[cdRec]', msg, data !== undefined ? data : ''); } catch (e) {}
+    }
+
+    _cdRecLog('script 已加载，准备启动检查');
+
+    async function doRecoverCheck(attempt) {
+        attempt = attempt || 1;
+        _cdRecLog('开始恢复检查，第 ' + attempt + ' 次');
+        try {
+            if (!window.localforage) {
+                _cdRecLog('❌ localforage 未加载');
+                if (attempt < 5) setTimeout(() => doRecoverCheck(attempt + 1), 2000);
+                return;
+            }
+
+            // 直接扫描所有 key，找含 companionLiveSession 的那个
+            // 这样不依赖 SESSION_ID 是否初始化
+            const allKeys = await localforage.keys();
+            _cdRecLog('localforage key 总数', allKeys.length);
+
+            const sessionKeys = allKeys.filter(k => k.indexOf('companionLiveSession') !== -1);
+            _cdRecLog('匹配的 session key', sessionKeys);
+
+            if (sessionKeys.length === 0) {
+                _cdRecLog('无未结束的会话');
+                return;
+            }
+
+            // 取最近一条（按心跳时间排序，最新的优先）
+            let bestSession = null;
+            let bestKey = null;
+            for (const k of sessionKeys) {
+                const s = await localforage.getItem(k);
+                if (s && s.mode && s.heartbeatTs) {
+                    if (!bestSession || s.heartbeatTs > bestSession.heartbeatTs) {
+                        bestSession = s;
+                        bestKey = k;
+                    }
+                }
+            }
+
+            _cdRecLog('最近的会话 key', bestKey);
+            _cdRecLog('会话数据', bestSession);
+
+            if (!bestSession) {
+                _cdRecLog('所有 key 都是空数据，清理');
+                for (const k of sessionKeys) {
+                    await localforage.removeItem(k).catch(() => {});
+                }
+                return;
+            }
+
+            const elapsedSinceHeartbeat = Date.now() - bestSession.heartbeatTs;
+            _cdRecLog('心跳距今秒数', Math.floor(elapsedSinceHeartbeat / 1000));
+
+            if (elapsedSinceHeartbeat > 24 * 60 * 60 * 1000) {
+                _cdRecLog('超过 24 小时，丢弃');
+                await localforage.removeItem(bestKey).catch(() => {});
+                return;
+            }
+
+            // 新逻辑：按真实墙上时间计算
+            // 不再"暂停时间"，而是"时间一直在跑"
+            const realElapsedSec = Math.floor((Date.now() - bestSession.startTs) / 1000)
+                                 + (bestSession.accumulatedExtendTime || 0);
+            _cdRecLog('从开始时间到现在的真实秒数', realElapsedSec);
+
+            // 把找到的真实 key 存起来，方便弹窗按钮使用
+            window.__cdRecoverFoundKey = bestKey;
+            window.__cdRecoverFoundSession = bestSession;
+            bestSession._realElapsedSec = realElapsedSec;
+
+            // 如果是倒计时模式 + 时间已经到了 → 自动写入日记 + 弹"已结束"提示
+            if (bestSession.isCountdown && realElapsedSec >= bestSession.totalSeconds) {
+                _cdRecLog('✓ 倒计时已到，自动写入日记 + 弹结束提示');
+                // 用正常的字卡逻辑（30% 概率不写、70% 抽 1-2 句）
+                const partnerNote = (typeof window.pickCompanionDiaryCards === 'function')
+                    ? window.pickCompanionDiaryCards()
+                    : '';
+                if (typeof window.addCompanionDiaryEntry === 'function') {
+                    await window.addCompanionDiaryEntry({
+                        ts: bestSession.startTs,
+                        mode: bestSession.mode,
+                        duration: bestSession.totalSeconds, // 完整时长
+                        initiator: bestSession.initiator || 'user',
+                        partnerNote: partnerNote,
+                        userNote: ''
+                    });
+                    _cdRecLog('✓ 日记已写入');
+                }
+                await localforage.removeItem(bestKey).catch(() => {});
+                // 弹"已结束"提示窗
+                if (typeof showCompanionCompletedDialog === 'function') {
+                    showCompanionCompletedDialog(bestSession);
+                    _cdRecLog('✓ 已结束提示已显示');
+                } else {
+                    setTimeout(() => {
+                        if (typeof showCompanionCompletedDialog === 'function') {
+                            showCompanionCompletedDialog(bestSession);
+                        }
+                    }, 2000);
+                }
+                return;
+            }
+
+            _cdRecLog('✓ 准备显示恢复弹窗');
+            if (typeof showCompanionRecoverDialog === 'function') {
+                showCompanionRecoverDialog(bestSession);
+                _cdRecLog('✓ 弹窗函数已调用');
+            } else {
+                _cdRecLog('❌ showCompanionRecoverDialog 函数不存在，等待 2 秒后重试');
+                setTimeout(() => {
+                    if (typeof showCompanionRecoverDialog === 'function') {
+                        showCompanionRecoverDialog(bestSession);
+                        _cdRecLog('✓ 重试成功，弹窗函数已调用');
+                    } else {
+                        _cdRecLog('❌ 重试后仍无 showCompanionRecoverDialog');
+                    }
+                }, 2000);
+            }
+        } catch(e) {
+            _cdRecLog('❌ 异常', String(e && e.message || e));
+        }
+    }
+
+    // 8 秒后启动（给 localforage、SESSION_ID 充足初始化时间）
+    setTimeout(() => doRecoverCheck(1), 8000);
+
+    // 通话闪退恢复（独立于陪伴的）
+    async function doCallRecoverCheck(attempt) {
+        attempt = attempt || 1;
+        try {
+            if (!window.localforage) {
+                if (attempt < 5) setTimeout(() => doCallRecoverCheck(attempt + 1), 2000);
+                return;
+            }
+            if (!window._callModule || !window._callModule.getCallSessionKey) {
+                if (attempt < 5) setTimeout(() => doCallRecoverCheck(attempt + 1), 2000);
+                return;
+            }
+
+            // 扫描 callLiveSession 相关 key
+            const allKeys = await localforage.keys();
+            const sessionKeys = allKeys.filter(k => k.indexOf('callLiveSession') !== -1);
+            if (sessionKeys.length === 0) return;
+
+            // 取最新的
+            let bestSession = null;
+            let bestKey = null;
+            for (const k of sessionKeys) {
+                const s = await localforage.getItem(k);
+                if (s && s.startTs && s.heartbeatTs) {
+                    if (!bestSession || s.heartbeatTs > bestSession.heartbeatTs) {
+                        bestSession = s;
+                        bestKey = k;
+                    }
+                }
+            }
+
+            if (!bestSession) {
+                // 清理无效数据
+                for (const k of sessionKeys) {
+                    await localforage.removeItem(k).catch(() => {});
+                }
+                return;
+            }
+
+            // 直接恢复通话（不弹任何窗），并弹一个 toast 提示
+            const ok = window._callModule.resumeFromSession(bestSession);
+            if (ok) {
+                if (typeof showNotification === 'function') {
+                    showNotification('通话已恢复', 'success', 3000);
+                }
+            } else {
+                // 恢复失败 → 清掉这个 session
+                await localforage.removeItem(bestKey).catch(() => {});
+            }
+        } catch (e) {
+            console.warn('[call-recover] error:', e);
+        }
+    }
+    setTimeout(() => doCallRecoverCheck(1), 8500);
+})();
+
+window.addEventListener('load', function() {
+    // 阶段三B：恢复未完成的图片上传队列（页面刷新后继续传）
+    setTimeout(function () {
+        if (!window.CloudMedia || typeof window.CloudMedia.restorePendingQueue !== 'function') return;
+        window.CloudMedia.restorePendingQueue(function (taskId, record) {
+            var msgId = record && record.messageId;
+            if (msgId == null) return null;
+            return async function (result) {
+                try {
+                    if (typeof messages === 'undefined' || !Array.isArray(messages)) return;
+                    var target = messages.find(function (m) { return String(m.id) === String(msgId); });
+                    if (!target) return;
+                    target.image = result.url;
+                    delete target.uploadStatus;
+                    try { if (typeof throttledSaveData === 'function') throttledSaveData(); } catch (e) {}
+                    try {
+                        var wrapper = document.querySelector('.message-wrapper[data-id="' + msgId + '"]');
+                        if (wrapper) {
+                            var wrap = wrapper.querySelector('.message-image-pending-wrap');
+                            if (wrap) {
+                                var img = wrap.querySelector('img');
+                                var parent = wrap.parentNode;
+                                if (img && parent) {
+                                    var blobUrl = null;
+                                    try {
+                                        blobUrl = window.CloudMedia ? await window.CloudMedia.fetchUrl(result.url) : null;
+                                    } catch (fetchErr) {
+                                        console.warn('[cloud-media] restore 拉图失败', fetchErr);
+                                    }
+                                    img.removeAttribute('data-pending-ref');
+                                    img.setAttribute('onclick', "viewImage('" + result.url + "')");
+                                    if (blobUrl) {
+                                        img.src = blobUrl;
+                                    } else {
+                                        img.src = '';
+                                        img.setAttribute('data-lazy-cloud-ref', result.url);
+                                        if (window.CloudMedia) window.CloudMedia.bindLazyImage(img, result.url);
+                                    }
+                                    parent.replaceChild(img, wrap);
+                                }
+                            }
+                        }
+                    } catch (e) { console.warn('[cloud-media] restore 局部更新失败', e); }
+                } catch (e) { console.warn(e); }
+            };
+        });
+    }, 3000);
+
+    setTimeout(function() {
+        // 启动顺序控制器已负责弹今日公告时，跳过这里的兜底逻辑，避免重复
+        if (!window.__bootGateDone) {
+            try {
+                if (localStorage.getItem('dailyGreetingShown') === new Date().toDateString()) return;
+                try { if (typeof checkPartnerDailyMood === 'function') checkPartnerDailyMood(); } catch(e2) { console.warn('checkPartnerDailyMood error:', e2); }
+                if (typeof _buildDailyGreeting === 'function') _buildDailyGreeting();
+                // 今日公告统一在桌面页弹出：弹出前确保处于桌面视图
+                function showGreetingOnDesktop() {
+                    if (window.DesktopTopbar && typeof window.DesktopTopbar.showDesktop === 'function') {
+                        window.DesktopTopbar.showDesktop();
+                    }
+                    var modal = document.getElementById('daily-greeting-modal');
+                    if (modal) modal.classList.remove('hidden');
+                    localStorage.setItem('dailyGreetingShown', new Date().toDateString());
+                }
+                if (window.localforage && window.APP_PREFIX) {
+                    localforage.getItem(window.APP_PREFIX + 'tour_seen').then(function(seen) {
+                        if (seen) showGreetingOnDesktop();
+                    }).catch(function() {
+                        showGreetingOnDesktop();
+                    });
+                } else {
+                    showGreetingOnDesktop();
+                }
+            } catch(e) { console.warn('Daily greeting timing error:', e); }
+        }
+
+        // 启动时检查梦角是否主动来信
+        try {
+            if (typeof checkEnvelopeStatus === 'function') {
+                checkEnvelopeStatus().catch(function(e) { console.warn('envelope launch check error:', e); });
+            }
+        } catch(e) { console.warn('envelope launch check error:', e); }
+    }, 4500);
+}, { once: true });
+
+// 陪伴闪退恢复弹窗
+function showCompanionRecoverDialog(session) {
+    const modeNames = { study: '学习', work: '工作', exercise: '运动', sleep: '睡觉', eat: '吃饭', slack: '摸鱼' };
+    const modeName = modeNames[session.mode] || '陪伴';
+    const startTime = new Date(session.startTs);
+    const startTimeStr = ('0' + startTime.getHours()).slice(-2) + ':' + ('0' + startTime.getMinutes()).slice(-2);
+
+    // 用真实墙上时间算（不再用心跳）
+    function calcElapsedSec() {
+        return Math.max(0, Math.floor((Date.now() - session.startTs) / 1000) + (session.accumulatedExtendTime || 0));
+    }
+    function formatMin(sec) {
+        const m = Math.floor(sec / 60);
+        return m >= 60
+            ? Math.floor(m / 60) + 'h ' + (m % 60) + 'min'
+            : m + 'min';
+    }
+
+    let elapsedSec = calcElapsedSec();
+    let canContinue = !(session.isCountdown && session.totalSeconds - elapsedSec <= 0);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'companion-recover-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.55);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;animation:fadeIn 0.25s ease;padding:20px;';
+
+    overlay.innerHTML = `
+        <div style="background:var(--secondary-bg);border-radius:20px;padding:24px 22px 20px;width:100%;max-width:340px;box-shadow:0 20px 60px rgba(0,0,0,0.4);font-family:var(--font-family);">
+            <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:6px;display:flex;align-items:center;gap:8px;">
+                <i class="fas fa-hourglass-half" style="color:var(--accent-color);"></i>
+                上次陪伴还没结束
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-bottom:16px;">
+                检测到一次未结束的「${modeName}」陪伴<br>
+                · 开始时间：${startTimeStr}<br>
+                · 已陪伴：<span id="_cmp_rec_elapsed">${formatMin(elapsedSec)}</span>
+                ${session.isCountdown ? '<br>· 剩余时间：约 <span id="_cmp_rec_remaining">' + formatMin(Math.max(0, session.totalSeconds - elapsedSec)) + '</span>' : ''}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;" id="_cmp_rec_btns">
+                <button id="_cmp_rec_continue" style="padding:11px;border:none;border-radius:12px;background:var(--accent-color);color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--font-family);${canContinue ? '' : 'display:none;'}">
+                    <i class="fas fa-play" style="margin-right:6px;"></i>继续陪伴
+                </button>
+                <button id="_cmp_rec_save" style="padding:11px;border:1px solid var(--border-color);border-radius:12px;background:var(--primary-bg);color:var(--text-primary);font-size:13px;cursor:pointer;font-family:var(--font-family);">
+                    <i class="fas fa-save" style="margin-right:6px;color:var(--accent-color);"></i>结束并保存到日记
+                </button>
+                <button id="_cmp_rec_discard" style="padding:11px;border:1px solid var(--border-color);border-radius:12px;background:none;color:var(--text-secondary);font-size:12px;cursor:pointer;font-family:var(--font-family);">
+                    丢弃这次陪伴
+                </button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    // 每秒刷新：让用户看到时间一直在跑
+    const tickHandle = setInterval(() => {
+        const curElapsed = calcElapsedSec();
+        const elEl = document.getElementById('_cmp_rec_elapsed');
+        const remEl = document.getElementById('_cmp_rec_remaining');
+        if (elEl) elEl.textContent = formatMin(curElapsed);
+
+        if (session.isCountdown) {
+            const remainSec = session.totalSeconds - curElapsed;
+            if (remEl) remEl.textContent = formatMin(Math.max(0, remainSec));
+
+            // 如果在弹窗页停留到时间过完了 → 自动转为"已结束"弹窗
+            if (remainSec <= 0) {
+                clearInterval(tickHandle);
+                // 自动完成：写入日记，提示用户
+                (async () => {
+                    if (typeof window._companionRecoverModule !== 'undefined') {
+                        // 用正常字卡逻辑
+                        const partnerNote = (typeof window.pickCompanionDiaryCards === 'function')
+                            ? window.pickCompanionDiaryCards()
+                            : '';
+                        if (typeof window.addCompanionDiaryEntry === 'function') {
+                            await window.addCompanionDiaryEntry({
+                                ts: session.startTs,
+                                mode: session.mode,
+                                duration: session.totalSeconds,
+                                initiator: session.initiator || 'user',
+                                partnerNote: partnerNote,
+                                userNote: ''
+                            });
+                        }
+                        window._companionRecoverModule.clearLiveSession();
+                    }
+                    closeDialog();
+                    if (typeof showCompanionCompletedDialog === 'function') {
+                        showCompanionCompletedDialog(session);
+                    }
+                })();
+            }
+        }
+    }, 1000);
+
+    function closeDialog() {
+        clearInterval(tickHandle);
+        overlay.remove();
+    }
+
+    const continueBtn = document.getElementById('_cmp_rec_continue');
+    if (continueBtn) {
+        continueBtn.onclick = function() {
+            const ok = window._companionRecoverModule.resumeFromSession(session);
+            if (!ok) {
+                // 恢复失败 → 写日记
+                window._companionRecoverModule.saveSessionAsDiary(session);
+                window._companionRecoverModule.clearLiveSession();
+            }
+            closeDialog();
+        };
+    }
+    document.getElementById('_cmp_rec_save').onclick = async function() {
+        await window._companionRecoverModule.saveSessionAsDiary(session);
+        window._companionRecoverModule.clearLiveSession();
+        if (typeof showNotification === 'function') showNotification('已保存到陪伴日记', 'success');
+        closeDialog();
+    };
+    document.getElementById('_cmp_rec_discard').onclick = function() {
+        if (!confirm('确定丢弃这次陪伴记录吗？')) return;
+        window._companionRecoverModule.clearLiveSession();
+        closeDialog();
+    };
+}
+
+// 陪伴已结束提示弹窗（倒计时模式：闪退后过太久，时间已经到了）
+function showCompanionCompletedDialog(session) {
+    const modeNames = { study: '学习', work: '工作', exercise: '运动', sleep: '睡觉', eat: '吃饭', slack: '摸鱼' };
+    const modeName = modeNames[session.mode] || '陪伴';
+    const startTime = new Date(session.startTs);
+    const startTimeStr = ('0' + startTime.getHours()).slice(-2) + ':' + ('0' + startTime.getMinutes()).slice(-2);
+
+    const totalMin = Math.floor(session.totalSeconds / 60);
+    const totalStr = totalMin >= 60
+        ? Math.floor(totalMin / 60) + 'h' + (totalMin % 60 > 0 ? ' ' + (totalMin % 60) + 'min' : '')
+        : totalMin + 'min';
+
+    const overlay = document.createElement('div');
+    overlay.id = 'companion-completed-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.55);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;animation:fadeIn 0.25s ease;padding:20px;';
+
+    overlay.innerHTML = `
+        <div style="background:var(--secondary-bg);border-radius:20px;padding:24px 22px 20px;width:100%;max-width:340px;box-shadow:0 20px 60px rgba(0,0,0,0.4);font-family:var(--font-family);">
+            <div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:6px;display:flex;align-items:center;gap:8px;">
+                <i class="fas fa-check-circle" style="color:var(--accent-color);"></i>
+                上次陪伴已结束
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary);line-height:1.7;margin-bottom:16px;">
+                这次「${modeName}」陪伴已经完整结束<br>
+                · 开始时间：${startTimeStr}<br>
+                · 陪伴时长：${totalStr}<br>
+                <span style="color:var(--accent-color);">已自动保存到陪伴日记 📔</span>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                <button id="_cmp_completed_ok" style="padding:11px;border:none;border-radius:12px;background:var(--accent-color);color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--font-family);">
+                    好的
+                </button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    document.getElementById('_cmp_completed_ok').onclick = function() {
+        overlay.remove();
+    };
+}
+
+// ============================================
+// 陪伴模式 (Companion Mode) - 新增功能
+// ============================================
+function selectCompanionMode(mode) {
+    // mode 可以是: 'study' | 'work' | 'exercise' | 'sleep'
+    const modeNames = {
+        study: '陪我学习',
+        work: '陪我工作',
+        exercise: '陪我运动',
+        sleep: '陪我睡觉',
+        eat: '陪我吃饭',
+        slack: '陪我摸鱼'
+    };
+
+    const modeName = modeNames[mode] || '陪伴';
+
+    // 关闭陪伴主弹窗
+    const modal = document.getElementById('companion-modal');
+    if (modal && typeof hideModal === 'function') {
+        hideModal(modal);
+    }
+
+    // 子页面占位 —— 后续可在此处接入对应子功能
+    // TODO: 后续接入 study / work / exercise / sleep 各自的子页面
+    setTimeout(() => {
+        if (typeof window.showToast === 'function') {
+            window.showToast(`已选择「${modeName}」，子页面开发中...`);
+        } else {
+            alert(`已选择「${modeName}」，子页面开发中...`);
+        }
+    }, 300);
+}
+
+
+// ============================================
+// TTS 真实语音 · 设置页逻辑
+// ============================================
+(function () {
+    'use strict';
+
+    let _lastSavedTtsConfig = null;
+    let _ttsConfigDirty = false;
+    let _ttsFieldsBound = false;
+
+    const TTS_FIELD_IDS = ['tts-minimax-key', 'tts-group-id', 'tts-model', 'tts-voice-id'];
+
+    function _normalizeTtsConfig(cfg) {
+        cfg = cfg || {};
+        let speed;
+        if (cfg.speed === undefined || cfg.speed === null || cfg.speed === '') {
+            speed = 1.0;
+        } else {
+            speed = Number(cfg.speed);
+            if (!isFinite(speed)) speed = 1.0;
+        }
+        speed = Math.max(0.5, Math.min(2.0, speed));
+        return {
+            minimaxKey: String(cfg.minimaxKey || '').trim(),
+            groupId: String(cfg.groupId || '').trim(),
+            model: String(cfg.model || 'speech-02-turbo').trim() || 'speech-02-turbo',
+            voiceId: String(cfg.voiceId || '').trim(),
+            targetLang: String(cfg.targetLang || 'JA').trim() || 'JA',
+            gender: String(cfg.gender || 'male').trim() || 'male',
+            styleText: String(cfg.styleText || '').trim(),
+            speed: speed
+        };
+    }
+
+    function _readTtsFormConfig() {
+        return _normalizeTtsConfig({
+            minimaxKey: document.getElementById('tts-minimax-key')?.value,
+            groupId: document.getElementById('tts-group-id')?.value,
+            model: document.getElementById('tts-model')?.value,
+            voiceId: document.getElementById('tts-voice-id')?.value,
+            targetLang: _getSelectedTtsLang(),
+            gender: document.querySelector('.tts-gender-btn.active')?.dataset.gender || 'male',
+            styleText: (document.getElementById('tts-style-text')?.value || '').trim(),
+            speed: document.getElementById('tts-speed')?.value
+        });
+    }
+
+    function _isSameTtsConfig(a, b) {
+        const left = _normalizeTtsConfig(a);
+        const right = _normalizeTtsConfig(b);
+        return left.minimaxKey === right.minimaxKey &&
+            left.groupId === right.groupId &&
+            left.model === right.model &&
+            left.voiceId === right.voiceId &&
+            left.targetLang === right.targetLang &&
+            left.gender === right.gender &&
+            left.styleText === right.styleText &&
+            left.speed === right.speed;
+    }
+
+    function _paintTtsLangButtons(selectedLang) {
+        document.querySelectorAll('.tts-lang-btn').forEach(btn => {
+            const isActive = btn.dataset.lang === selectedLang;
+            btn.classList.toggle('active', isActive);
+            btn.style.border = isActive ? '1px solid var(--accent-color)' : '1px solid var(--border-color)';
+            btn.style.background = isActive ? 'rgba(var(--accent-color-rgb),0.1)' : 'transparent';
+            btn.style.color = isActive ? 'var(--accent-color)' : 'var(--text-secondary)';
+            btn.style.fontWeight = isActive ? '600' : 'normal';
+        });
+        // 选原文时隐藏翻译选项
+        const translateOpts = document.getElementById('tts-translate-options');
+        if (translateOpts) translateOpts.style.display = selectedLang === 'RAW' ? 'none' : '';
+    }
+
+    function _getSelectedTtsLang() {
+        return document.querySelector('.tts-lang-btn.active')?.dataset.lang || 'JA';
+    }
+
+    function _hasSavedTtsConfig() {
+        const cfg = _normalizeTtsConfig(_lastSavedTtsConfig || {});
+        return !!(cfg.minimaxKey || cfg.groupId || cfg.voiceId || cfg.model !== 'speech-02-turbo' || cfg.targetLang !== 'JA');
+    }
+
+    function _applyTtsSaveButtonState(isDirty) {
+        const saveBtn = document.getElementById('tts-save-btn');
+        if (!saveBtn) return;
+
+        saveBtn.disabled = !isDirty;
+        saveBtn.textContent = isDirty ? '保存配置' : (_hasSavedTtsConfig() ? '已保存' : '保存配置');
+        saveBtn.style.background = isDirty ? 'var(--accent-color)' : 'var(--border-color)';
+        saveBtn.style.color = isDirty ? '#fff' : 'var(--text-secondary)';
+        saveBtn.style.cursor = isDirty ? 'pointer' : 'not-allowed';
+        saveBtn.style.opacity = isDirty ? '1' : '0.65';
+        saveBtn.style.boxShadow = isDirty ? '0 4px 14px rgba(var(--accent-color-rgb),0.24)' : 'none';
+        saveBtn.style.transform = 'none';
+    }
+
+    function _setTtsDirty(isDirty) {
+        _ttsConfigDirty = !!isDirty;
+        _applyTtsSaveButtonState(_ttsConfigDirty);
+        _updateTtsStatus();
+    }
+
+    function _checkTtsDirty() {
+        if (!_lastSavedTtsConfig && window.voiceTTS) {
+            _lastSavedTtsConfig = _normalizeTtsConfig(window.voiceTTS.getTtsConfig());
+        }
+        _setTtsDirty(!_isSameTtsConfig(_readTtsFormConfig(), _lastSavedTtsConfig));
+    }
+
+    function _bindTtsFieldListeners() {
+        if (_ttsFieldsBound) return;
+        const fields = TTS_FIELD_IDS
+            .map(id => document.getElementById(id))
+            .filter(Boolean);
+        if (fields.length !== TTS_FIELD_IDS.length) return;
+
+        fields.forEach(el => {
+            el.addEventListener('input', _checkTtsDirty);
+            el.addEventListener('change', _checkTtsDirty);
+        });
+        _ttsFieldsBound = true;
+    }
+
+    // ─── 初始化：打开聊天设置时填入已保存的值 ───
+    function _initTtsFields() {
+        if (!window.voiceTTS) return;
+        const cfg = _normalizeTtsConfig(window.voiceTTS.getTtsConfig());
+        const mKey  = document.getElementById('tts-minimax-key');
+        const gId   = document.getElementById('tts-group-id');
+        const model = document.getElementById('tts-model');
+        const vId   = document.getElementById('tts-voice-id');
+        const styleText = document.getElementById('tts-style-text');
+        const styleCount = document.getElementById('tts-style-count');
+        const speedEl   = document.getElementById('tts-speed');
+        const speedInput = document.getElementById('tts-speed-value'); // 现在是 input 不是 span
+        if (mKey)  mKey.value  = cfg.minimaxKey;
+        if (gId)   gId.value   = cfg.groupId;
+        if (model) model.value = cfg.model;
+        if (vId)   vId.value   = cfg.voiceId;
+        if (styleText) { styleText.value = cfg.styleText || ''; }
+        if (styleCount) styleCount.textContent = (cfg.styleText || '').length;
+        if (speedEl)    speedEl.value = String(cfg.speed);
+        if (speedInput) speedInput.value = cfg.speed.toFixed(2);
+        // 滑块 ↔ 输入框双向同步 + dirty 检测（只绑一次）
+        if (speedEl && !speedEl.dataset.bound) {
+            speedEl.dataset.bound = '1';
+            speedEl.addEventListener('input', () => {
+                // 拖滑块 → 同步到输入框
+                if (speedInput) speedInput.value = Number(speedEl.value).toFixed(2);
+                _checkTtsDirty();
+            });
+        }
+        if (speedInput && !speedInput.dataset.bound) {
+            speedInput.dataset.bound = '1';
+            // 输入框变化时 → 同步到滑块
+            // 用 input 事件实时同步；用 change/blur 时做边界夹紧（避免打字打到一半被改值）
+            speedInput.addEventListener('input', () => {
+                const v = Number(speedInput.value);
+                if (isFinite(v) && speedEl) {
+                    // 实时反映到滑块（不强制夹边界，让用户继续打字）
+                    speedEl.value = String(Math.max(0.5, Math.min(2, v)));
+                }
+                _checkTtsDirty();
+            });
+            const clampInput = () => {
+                let v = Number(speedInput.value);
+                if (!isFinite(v) || speedInput.value === '') v = 1.0;
+                v = Math.max(0.5, Math.min(2, v));
+                // 四舍五入到 0.01
+                v = Math.round(v * 100) / 100;
+                speedInput.value = v.toFixed(2);
+                if (speedEl) speedEl.value = String(v);
+                _checkTtsDirty();
+            };
+            speedInput.addEventListener('change', clampInput);
+            speedInput.addEventListener('blur', clampInput);
+            // 回车直接确认（防止表单意外提交）
+            speedInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    clampInput();
+                    speedInput.blur();
+                }
+            });
+        }
+        _lastSavedTtsConfig = cfg;
+        _paintTtsLangButtons(cfg.targetLang);
+        // 性别按钮高亮
+        const savedGender = cfg.gender || 'male';
+        document.querySelectorAll('.tts-gender-btn').forEach(btn => {
+            const isActive = btn.dataset.gender === savedGender;
+            btn.classList.toggle('active', isActive);
+            btn.style.border = isActive ? '1px solid var(--accent-color)' : '1px solid var(--border-color)';
+            btn.style.background = isActive ? 'rgba(var(--accent-color-rgb),0.1)' : 'transparent';
+            btn.style.color = isActive ? 'var(--accent-color)' : 'var(--text-secondary)';
+            btn.style.fontWeight = isActive ? '600' : 'normal';
+        });
+        _bindTtsFieldListeners();
+        _setTtsDirty(false);
+    }
+
+    function _updateTtsStatus() {
+        const el = document.getElementById('tts-status');
+        if (!el || !window.voiceTTS) return;
+        if (_ttsConfigDirty) {
+            el.style.color = 'var(--accent-color)';
+            el.textContent = '配置有修改，点击保存配置后才会生效';
+            return;
+        }
+        if (window.voiceTTS.isTtsReady()) {
+            el.style.color = '#4CAF50';
+            el.textContent = '✓ 配置已保存，真实语音已启用';
+        } else {
+            el.style.color = 'var(--text-secondary)';
+            el.textContent = '填写 MiniMax API Key、Group ID 和 Voice ID 后保存即可启用';
+        }
+    }
+
+    // ─── 语言切换 ───
+    window._setTtsLang = function(lang) {
+        const nextLang = lang || 'JA';
+        _paintTtsLangButtons(nextLang);
+        _checkTtsDirty();
+    };
+
+    // ─── 性别切换 ───
+    window._setTtsGender = function(gender, btn) {
+        document.querySelectorAll('.tts-gender-btn').forEach(b => {
+            const isActive = b === btn;
+            b.classList.toggle('active', isActive);
+            b.style.border = isActive ? '1px solid var(--accent-color)' : '1px solid var(--border-color)';
+            b.style.background = isActive ? 'rgba(var(--accent-color-rgb),0.1)' : 'transparent';
+            b.style.color = isActive ? 'var(--accent-color)' : 'var(--text-secondary)';
+            b.style.fontWeight = isActive ? '600' : 'normal';
+        });
+        _checkTtsDirty();
+    };
+
+    // ─── 风格预设 ───
+    window._setTtsStylePreset = function(btn) {
+        const styleText = document.getElementById('tts-style-text');
+        const styleCount = document.getElementById('tts-style-count');
+        if (styleText) {
+            styleText.value = btn.dataset.style || '';
+            if (styleCount) styleCount.textContent = styleText.value.length;
+        }
+        _checkTtsDirty();
+    };
+
+    // ─── 保存配置 ───
+    window._saveTtsConfig = function () {
+        if (!window.voiceTTS || !_ttsConfigDirty) return;
+        const cfg = _readTtsFormConfig();
+        window.voiceTTS.saveTtsConfig(cfg.minimaxKey, cfg.groupId, cfg.voiceId, cfg.model, cfg.targetLang, cfg.gender, cfg.styleText, cfg.speed);
+        _lastSavedTtsConfig = cfg;
+        _setTtsDirty(false);
+        // 清掉内存缓存，让下次点击用新设置重新翻译+TTS
+        // 注意：IndexedDB 里的收藏音频不动
+        if (window.voiceTTS.clearMemoryCache) window.voiceTTS.clearMemoryCache();
+        if (typeof showNotification === 'function') {
+            showNotification('配置已保存，语音缓存已重置', 'success');
+        }
+    };
+
+    // ─── 试听：用当前表单状态合成测试句，按滑块语速本地播放 ───
+    // 不读 / 不写 localStorage，所以可以在「保存」之前就听到效果。
+    let _speedPreviewAudio = null;
+    window._previewTts = async function () {
+        if (!window.voiceTTS) return;
+        const btn   = document.getElementById('tts-preview-btn');
+        const label = document.getElementById('tts-preview-label');
+        const speedEl = document.getElementById('tts-speed');
+
+        // 正在播放 → 再点一次=停止
+        if (_speedPreviewAudio && !_speedPreviewAudio.paused) {
+            try { _speedPreviewAudio.pause(); } catch (_) {}
+            _speedPreviewAudio = null;
+            if (label) label.textContent = '试听';
+            return;
+        }
+
+        const cfg = _readTtsFormConfig();
+        if (!cfg.minimaxKey || !cfg.groupId || !cfg.voiceId) {
+            if (typeof showNotification === 'function') {
+                showNotification('请先填写 MiniMax Key、Group ID 和 Voice ID', 'error');
+            }
+            return;
+        }
+
+        if (btn) btn.disabled = true;
+        if (label) label.textContent = '生成中…';
+
+        try {
+            const audioUrl = await window.voiceTTS.previewWithConfig(cfg);
+            const audio = new Audio(audioUrl);
+            // 按滑块当前值（未保存）应用语速 + 保留音调
+            const currentSpeed = speedEl ? Number(speedEl.value) : cfg.speed;
+            window.voiceTTS.applyPlaybackSettings(audio, currentSpeed);
+            _speedPreviewAudio = audio;
+            if (label) label.textContent = '播放中';
+            audio.onended = () => {
+                if (label) label.textContent = '试听';
+                if (_speedPreviewAudio === audio) _speedPreviewAudio = null;
+            };
+            audio.onerror = () => {
+                if (label) label.textContent = '试听';
+                if (_speedPreviewAudio === audio) _speedPreviewAudio = null;
+                if (typeof showNotification === 'function') showNotification('试听播放失败', 'error');
+            };
+            await audio.play();
+        } catch (err) {
+            console.error('[tts-preview]', err);
+            if (label) label.textContent = '试听';
+            if (typeof showNotification === 'function') {
+                showNotification('试听失败：' + (err.message || '未知错误'), 'error');
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    };
+
+    // 拖动滑块或输入数字时，如果正在播放试听，实时改变播放速度（即时反馈）
+    document.addEventListener('input', (e) => {
+        if (!_speedPreviewAudio || !window.voiceTTS) return;
+        if (e.target && (e.target.id === 'tts-speed' || e.target.id === 'tts-speed-value')) {
+            const v = Number(e.target.value);
+            if (isFinite(v)) {
+                window.voiceTTS.applyPlaybackSettings(_speedPreviewAudio, Math.max(0.5, Math.min(2, v)));
+            }
+        }
+    });
+
+    // ─── 聊天设置打开时初始化 ───
+    const chatModal = document.getElementById('chat-modal');
+    if (chatModal) {
+        const observer = new MutationObserver(() => {
+            if (chatModal.classList.contains('active')) {
+                setTimeout(_initTtsFields, 50);
+            }
+        });
+        observer.observe(chatModal, { attributes: true, attributeFilter: ['class'] });
+    }
+
+    // ─── 页面加载时也回填一次（防止刷新后显示空白）───
+    document.addEventListener('DOMContentLoaded', () => setTimeout(_initTtsFields, 300));
+    setTimeout(_initTtsFields, 500);
+
+    // ============================================
+    // 声音克隆 Modal 控制
+    // ============================================
+    let _clonedVoiceId = null;
+    let _previewAudio  = null;
+
+    window._openVoiceCloneModal = function () {
+        const modal = document.getElementById('voice-clone-modal');
+        if (!modal) return;
+        _resetCloneModal();
+        // 兼容不同时机：优先用全局showModal，否则直接操作class
+        if (typeof showModal === 'function') {
+            showModal(modal);
+        } else {
+            modal.classList.add('active');
+            document.body.classList.add('modal-open');
+        }
+    };
+
+    window._closeVoiceCloneModal = function () {
+        const modal = document.getElementById('voice-clone-modal');
+        if (!modal) return;
+        if (typeof hideModal === 'function') {
+            hideModal(modal);
+        } else {
+            modal.classList.remove('active');
+            document.body.classList.remove('modal-open');
+        }
+        if (_previewAudio) { _previewAudio.pause(); _previewAudio = null; }
+    };
+
+    function _resetCloneModal() {
+        _clonedVoiceId = null;
+        if (_previewAudio) { _previewAudio.pause(); _previewAudio = null; }
+        const s1 = document.getElementById('voice-clone-step1');
+        const s2 = document.getElementById('voice-clone-step2');
+        const loading = document.getElementById('voice-clone-loading');
+        const preview = document.getElementById('voice-clone-preview');
+        const status  = document.getElementById('voice-clone-step1-status');
+        const label   = document.getElementById('voice-clone-upload-label');
+        const fileInput = document.getElementById('voice-clone-file-input');
+        if (s1) s1.style.display = '';
+        if (s2) s2.style.display = 'none';
+        if (loading) loading.style.display = '';
+        if (preview) preview.style.display = 'none';
+        if (status)  status.textContent = '';
+        if (label)   label.textContent  = '点击选择音频文件';
+        if (fileInput) fileInput.value  = '';
+    }
+
+    window._retryVoiceClone = _resetCloneModal;
+
+    // 文件选择后更新标签
+    document.addEventListener('DOMContentLoaded', function () {
+        const fileInput = document.getElementById('voice-clone-file-input');
+        if (fileInput) {
+            fileInput.addEventListener('change', function () {
+                const label = document.getElementById('voice-clone-upload-label');
+                if (label && fileInput.files[0]) {
+                    label.textContent = '已选择：' + fileInput.files[0].name;
+                }
+            });
+        }
+    });
+
+    // ─── 开始克隆 ───
+    window._startVoiceClone = async function () {
+        if (!window.voiceTTS) return;
+        const fileInput = document.getElementById('voice-clone-file-input');
+        const file = fileInput && fileInput.files[0];
+        if (!file) {
+            const status = document.getElementById('voice-clone-step1-status');
+            if (status) { status.style.color = '#e57373'; status.textContent = '请先选择音频文件'; }
+            return;
+        }
+        const name = (document.getElementById('voice-clone-name')?.value || '').trim() || '梦角';
+
+        // 切到 step2 · loading
+        const s1 = document.getElementById('voice-clone-step1');
+        const s2 = document.getElementById('voice-clone-step2');
+        if (s1) s1.style.display = 'none';
+        if (s2) s2.style.display = '';
+
+        try {
+            _clonedVoiceId = await window.voiceTTS.cloneVoice(file, name);
+            // 显示预览区
+            const loading = document.getElementById('voice-clone-loading');
+            const preview = document.getElementById('voice-clone-preview');
+            if (loading) loading.style.display = 'none';
+            if (preview) preview.style.display = '';
+        } catch (err) {
+            console.error('[voice-clone]', err);
+            // 回到 step1 并显示错误
+            if (s1) s1.style.display = '';
+            if (s2) s2.style.display = 'none';
+            const status = document.getElementById('voice-clone-step1-status');
+            if (status) {
+                status.style.color = '#e57373';
+                status.textContent = '克隆失败：' + (err.message || '请检查 API Key 和网络');
+            }
+        }
+    };
+
+    // ─── 试听 ───
+    window._playVoicePreview = async function () {
+        if (!_clonedVoiceId || !window.voiceTTS) return;
+        const btn = document.getElementById('voice-clone-play-preview');
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> 生成中…'; }
+        try {
+            // 先把临时 voiceId 存进配置用于试听（不影响真正保存）
+            const cfg = window.voiceTTS.getTtsConfig();
+            const origId = cfg.voiceId;
+            window.voiceTTS.saveTtsConfig(cfg.minimaxKey, cfg.groupId, _clonedVoiceId, cfg.model, cfg.targetLang);
+
+            const audioUrl = await window.voiceTTS.previewClonedVoice(_clonedVoiceId);
+            if (_previewAudio) _previewAudio.pause();
+            _previewAudio = new Audio(audioUrl);
+            _previewAudio.play();
+            _previewAudio.onended = () => {
+                if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-play"></i> 再听一次'; }
+            };
+
+            // 恢复原 voiceId（等确认后才真正写入）
+            window.voiceTTS.saveTtsConfig(cfg.minimaxKey, cfg.groupId, origId, cfg.model, cfg.targetLang);
+        } catch (err) {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-play"></i> 试听效果'; }
+            if (typeof showNotification === 'function') {
+                showNotification('试听失败：' + (err.message || ''), 'error');
+            }
+        }
+    };
+
+    // ─── 确认使用克隆的声音 ───
+    window._confirmVoiceClone = function () {
+        if (!_clonedVoiceId || !window.voiceTTS) return;
+
+        // 同步回设置页输入框，但不直接保存。
+        // 让用户统一点击「保存配置」后再生效，避免配置被悄悄改掉。
+        const vIdInput = document.getElementById('tts-voice-id');
+        if (vIdInput) vIdInput.value = _clonedVoiceId;
+        _checkTtsDirty();
+
+        window._closeVoiceCloneModal();
+        if (typeof showNotification === 'function') {
+            showNotification('声音 ID 已填入，请点击保存配置后生效', 'success');
+        }
+    };
+
+})();
